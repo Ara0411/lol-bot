@@ -1,5 +1,6 @@
 import logging
 import unicodedata
+from dataclasses import dataclass
 
 import discord
 from discord import app_commands
@@ -28,6 +29,19 @@ COLOR_OPEN = 0x3498DB
 COLOR_SUMMARY = 0xFFD700
 
 
+@dataclass
+class Participant:
+    is_proxy: bool
+    parsed: ParsedNickname | None
+    # own
+    uid: int | None = None
+    member: discord.Member | None = None
+    # proxy
+    name: str | None = None
+    proxy_by_user_id: int | None = None
+    proxy_by_name: str | None = None
+
+
 async def _resolve_member(guild: discord.Guild, user_id: int) -> discord.Member | None:
     member = guild.get_member(user_id)
     if member is not None:
@@ -36,14 +50,6 @@ async def _resolve_member(guild: discord.Guild, user_id: int) -> discord.Member 
         return await guild.fetch_member(user_id)
     except (discord.NotFound, discord.HTTPException):
         return None
-
-
-def _format_line(idx: int, uid: int, member: discord.Member | None, parsed: ParsedNickname | None) -> str:
-    if parsed and parsed.is_valid:
-        return f"`{idx:>2}.` **{parsed.name}** / {parsed.tier_display} / {parsed.positions_display}"
-    if member is not None:
-        return f"`{idx:>2}.` {member.mention} ⚠️ 닉네임 형식 확인 필요"
-    return f"`{idx:>2}.` <@{uid}> ⚠️ 멤버 정보 없음"
 
 
 def _display_width(s: str) -> int:
@@ -57,57 +63,110 @@ def _ljust_visual(s: str, n: int) -> str:
     return s + " " * max(0, n - _display_width(s))
 
 
-def _format_grouped_aligned(items) -> str:
-    """티어 그룹별로 빈 줄을 끼우고, 코드블록 안에서 컬럼 정렬."""
+def _participant_display_name(p: Participant) -> str:
+    """이름 컬럼에 표시할 문자열."""
+    if p.parsed and p.parsed.is_valid:
+        return p.parsed.name
+    if p.is_proxy:
+        return p.name or "?"
+    if p.member is not None:
+        return p.member.display_name
+    return f"id:{p.uid}"
+
+
+def _format_line(idx: int, p: Participant) -> str:
+    """모집 중(번호 매기는) 표시. 마크다운 활성."""
+    if p.parsed and p.parsed.is_valid:
+        base = f"`{idx:>2}.` **{p.parsed.name}** / {p.parsed.tier_display} / {p.parsed.positions_display}"
+        if p.is_proxy:
+            base += f"  *(대리: {p.proxy_by_name or '?'})*"
+        return base
+    # invalid nickname fallback
+    if p.is_proxy:
+        return f"`{idx:>2}.` **{p.name}** ⚠️ 닉 형식 오류 *(대리: {p.proxy_by_name or '?'})*"
+    if p.member is not None:
+        return f"`{idx:>2}.` {p.member.mention} ⚠️ 닉네임 형식 확인 필요"
+    return f"`{idx:>2}.` <@{p.uid}> ⚠️ 멤버 정보 없음"
+
+
+def _format_grouped_aligned(items: list[Participant]) -> str:
+    """티어 그룹별로 빈 줄 + 코드블록 안 컬럼 정렬 (마감/정리용)."""
     if not items:
         return "없음"
 
-    rows: list[tuple[str, str, str, str]] = []
-    for uid, member, parsed in items:
-        if parsed and parsed.is_valid:
-            rows.append((parsed.name, parsed.tier_display, parsed.positions_display, parsed.tier_name))
-        elif member is not None:
-            rows.append((member.display_name, "?", "닉 형식 확인 필요", "_invalid"))
+    rows: list[tuple[str, str, str, str, str]] = []
+    # (name, tier_text, pos, tier_name_key, suffix)
+    for p in items:
+        if p.parsed and p.parsed.is_valid:
+            suffix = f"(대리: {p.proxy_by_name or '?'})" if p.is_proxy else ""
+            rows.append((p.parsed.name, p.parsed.tier_display, p.parsed.positions_display, p.parsed.tier_name, suffix))
+        elif p.is_proxy:
+            rows.append((p.name or "?", "?", "닉 형식 오류", "_invalid", f"(대리: {p.proxy_by_name or '?'})"))
+        elif p.member is not None:
+            rows.append((p.member.display_name, "?", "닉 형식 확인 필요", "_invalid", ""))
         else:
-            rows.append((f"id:{uid}", "?", "멤버 정보 없음", "_invalid"))
+            rows.append((f"id:{p.uid}", "?", "멤버 정보 없음", "_invalid", ""))
 
     name_w = max(_display_width(r[0]) for r in rows)
     tier_w = max(_display_width(r[1]) for r in rows)
-    SEP = "    "  # 컬럼 사이 4칸
+    pos_w = max(_display_width(r[2]) for r in rows)
+    SEP = "    "
 
     lines: list[str] = []
     last: str | None = None
-    for name, tier_text, pos, key in rows:
+    for name, tier_text, pos, key, suffix in rows:
         if last is not None and last != key:
             lines.append("")
         last = key
-        lines.append(
-            f"{_ljust_visual(name, name_w)}{SEP}{_ljust_visual(tier_text, tier_w)}{SEP}{pos}"
-        )
+        line = f"{_ljust_visual(name, name_w)}{SEP}{_ljust_visual(tier_text, tier_w)}{SEP}{_ljust_visual(pos, pos_w)}"
+        if suffix:
+            line += f"{SEP}{suffix}"
+        lines.append(line)
 
     return "```\n" + "\n".join(lines) + "\n```"
 
 
 async def _resolve_participants(bot: commands.Bot, scrim_row):
-    """Returns (main_list, wait_list) of (uid, member, parsed) tuples."""
+    """본인 + 대리 참가자 통합. (main_list, wait_list of Participant)."""
     guild = bot.get_guild(scrim_row["guild_id"])
-    raw = db.get_participants(scrim_row["scrim_id"])
-    main_list: list[tuple[int, discord.Member | None, ParsedNickname | None]] = []
-    wait_list: list[tuple[int, discord.Member | None, ParsedNickname | None]] = []
-    for uid, is_wl in raw:
+    main_list: list[Participant] = []
+    wait_list: list[Participant] = []
+
+    # 본인 참가자
+    for uid, is_wl in db.get_participants(scrim_row["scrim_id"]):
         if guild is not None:
             member = await _resolve_member(guild, uid)
             parsed = parse_nickname(member.display_name) if member else None
         else:
             member, parsed = None, None
-        (wait_list if is_wl else main_list).append((uid, member, parsed))
+        p = Participant(is_proxy=False, uid=uid, member=member, parsed=parsed)
+        (wait_list if is_wl else main_list).append(p)
+
+    # 대리 참가자
+    for row in db.get_proxy_participants(scrim_row["scrim_id"]):
+        nick_str = f"{row['name']}/{row['tier_raw']}/{row['positions']}"
+        parsed = parse_nickname(nick_str)
+        proxy_by_name = "?"
+        if guild is not None:
+            proxy_by = await _resolve_member(guild, row["proxy_by_user_id"])
+            if proxy_by:
+                proxy_by_parsed = parse_nickname(proxy_by.display_name)
+                proxy_by_name = proxy_by_parsed.name if proxy_by_parsed.is_valid else proxy_by.display_name
+        p = Participant(
+            is_proxy=True,
+            parsed=parsed,
+            name=row["name"],
+            proxy_by_user_id=row["proxy_by_user_id"],
+            proxy_by_name=proxy_by_name,
+        )
+        (wait_list if row["is_waitlist"] else main_list).append(p)
+
     return main_list, wait_list
 
 
-def _tier_sort_key(item):
-    _, _, parsed = item
-    if parsed and parsed.is_valid:
-        return (0, -parsed.tier_order, -parsed.tier_score)
+def _tier_sort_key(p: Participant):
+    if p.parsed and p.parsed.is_valid:
+        return (0, -p.parsed.tier_order, -p.parsed.tier_score)
     return (1, 0, 0)
 
 
@@ -125,30 +184,36 @@ async def build_embed(bot: commands.Bot, scrim_row) -> discord.Embed:
     )
 
     if main_list:
-        lines = [_format_line(i, uid, m, p) for i, (uid, m, p) in enumerate(main_list, 1)]
+        lines = [_format_line(i, p) for i, p in enumerate(main_list, 1)]
         embed.add_field(name="✅ 참가자 (참가 순)", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="✅ 참가자 (참가 순)", value="없음", inline=False)
 
     wait_label = f"🕐 대기자 ({len(wait_list)}명)" if wait_list else "🕐 대기자"
     if wait_list:
-        lines = [_format_line(i, uid, m, p) for i, (uid, m, p) in enumerate(wait_list, 1)]
+        lines = [_format_line(i, p) for i, p in enumerate(wait_list, 1)]
         embed.add_field(name=wait_label, value="\n".join(lines), inline=False)
     else:
         embed.add_field(name=wait_label, value="없음", inline=False)
 
-    embed.set_footer(text="닉네임 형식: 롤닉네임#태그/티어/라인  (예: 완댕이#명명펀치/M350/MID.TOP)")
+    embed.set_footer(text="닉네임 형식: 롤닉네임#태그/티어/라인  (예: 완댕이#명명펀치/M350/MID.TOP) · /대신참가 로 대리 등록 가능")
     return embed
 
 
 async def build_summary_embed(bot: commands.Bot, scrim_row) -> discord.Embed:
-    """참가자를 티어 그룹별로 정리한 임베드."""
     main_list, _ = await _resolve_participants(bot, scrim_row)
     main_list.sort(key=_tier_sort_key)
 
     embed = discord.Embed(title="⭐ 참여자 티어 정보", color=COLOR_SUMMARY)
     embed.description = _format_grouped_aligned(main_list) if main_list else "참여자 없음"
     return embed
+
+
+def _count_main(scrim_id: int) -> int:
+    """본인 + 대리 합쳐서 정참가자 수."""
+    own = sum(1 for _, wl in db.get_participants(scrim_id) if not wl)
+    proxy = sum(1 for r in db.get_proxy_participants(scrim_id) if not r["is_waitlist"])
+    return own + proxy
 
 
 class ScrimView(discord.ui.View):
@@ -189,9 +254,7 @@ class ScrimView(discord.ui.View):
 
     async def _refresh(self, interaction: discord.Interaction) -> None:
         scrim = db.get_scrim(self.scrim_id)
-        participants = db.get_participants(self.scrim_id)
-        main_count = sum(1 for _, wl in participants if not wl)
-        self._update_button_state(main_count, scrim["capacity"])
+        self._update_button_state(_count_main(self.scrim_id), scrim["capacity"])
         embed = await build_embed(interaction.client, scrim)
         await interaction.response.edit_message(embed=embed, view=self)
 
@@ -206,12 +269,11 @@ class ScrimView(discord.ui.View):
             await interaction.response.send_message(NICK_FORMAT_HELP, ephemeral=True)
             return
 
-        participants = db.get_participants(self.scrim_id)
-        if any(uid == interaction.user.id for uid, _ in participants):
+        if any(uid == interaction.user.id for uid, _ in db.get_participants(self.scrim_id)):
             await interaction.response.send_message("이미 참가 중입니다.", ephemeral=True)
             return
 
-        main_count_before = sum(1 for _, wl in participants if not wl)
+        main_count_before = _count_main(self.scrim_id)
         as_waitlist = main_count_before >= scrim["capacity"]
 
         if not db.add_participant(self.scrim_id, interaction.user.id, as_waitlist):
@@ -219,11 +281,9 @@ class ScrimView(discord.ui.View):
             return
 
         await self._refresh(interaction)
-
         if as_waitlist:
             await interaction.followup.send(
-                "🕐 정원이 다 차서 **대기자**로 등록되었어요. "
-                "정원에서 한 자리 비면 자동으로 참가자가 됩니다.",
+                "🕐 정원이 다 차서 **대기자**로 등록되었어요. 자리 비면 자동 승격됩니다.",
                 ephemeral=True,
             )
 
@@ -233,22 +293,25 @@ class ScrimView(discord.ui.View):
             await interaction.response.send_message("모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
-        participants = db.get_participants(self.scrim_id)
-        target_wl = next((wl for uid, wl in participants if uid == interaction.user.id), None)
+        target_wl = next(
+            (wl for uid, wl in db.get_participants(self.scrim_id) if uid == interaction.user.id),
+            None,
+        )
         if target_wl is None:
             await interaction.response.send_message("참가 중이 아닙니다.", ephemeral=True)
             return
 
         was_main = (target_wl == 0)
         db.remove_participant(self.scrim_id, interaction.user.id)
-        promoted_uid = db.promote_oldest_waitlist(self.scrim_id) if was_main else None
+        promoted = db.promote_oldest_waitlist(self.scrim_id) if was_main else None
 
         await self._refresh(interaction)
-        if promoted_uid is not None:
-            await interaction.followup.send(
-                f"<@{promoted_uid}>님이 대기자에서 참가자로 자동 승격되었어요! 🎉",
-                ephemeral=False,
-            )
+        if promoted:
+            if promoted["type"] == "own":
+                msg = f"<@{promoted['user_id']}>님이 대기자에서 참가자로 자동 승격되었어요! 🎉"
+            else:
+                msg = f"**{promoted['name']}**님(대리)이 대기자에서 참가자로 자동 승격되었어요! 🎉"
+            await interaction.followup.send(msg, ephemeral=False)
 
     async def _on_summary(self, interaction: discord.Interaction):
         scrim = db.get_scrim(self.scrim_id)
@@ -256,17 +319,36 @@ class ScrimView(discord.ui.View):
             await interaction.response.send_message("모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
-        participants = db.get_participants(self.scrim_id)
-        main_count = sum(1 for _, wl in participants if not wl)
-        if main_count < scrim["capacity"]:
+        if _count_main(self.scrim_id) < scrim["capacity"]:
             await interaction.response.send_message(
-                f"아직 정원이 안 찼어요 ({main_count}/{scrim['capacity']})", ephemeral=True
+                f"아직 정원이 안 찼어요 ({_count_main(self.scrim_id)}/{scrim['capacity']})",
+                ephemeral=True,
             )
             return
 
         await interaction.response.defer()
         summary = await build_summary_embed(interaction.client, scrim)
         await interaction.channel.send(embed=summary)
+
+
+async def _refresh_scrim_message(bot: commands.Bot, scrim_row) -> None:
+    """모집 메시지를 다시 그려서 업데이트 (슬래시 커맨드에서 사용)."""
+    if scrim_row["message_id"] is None:
+        return
+    channel = bot.get_channel(scrim_row["channel_id"])
+    if channel is None:
+        return
+    try:
+        msg = await channel.fetch_message(scrim_row["message_id"])
+    except (discord.NotFound, discord.HTTPException):
+        return
+    is_full = _count_main(scrim_row["scrim_id"]) >= scrim_row["capacity"]
+    view = ScrimView(scrim_row["scrim_id"], is_full=is_full)
+    embed = await build_embed(bot, scrim_row)
+    try:
+        await msg.edit(embed=embed, view=view)
+    except discord.HTTPException:
+        pass
 
 
 class ScrimCog(commands.Cog):
@@ -277,9 +359,7 @@ class ScrimCog(commands.Cog):
         rows = db.get_persistent_scrims()
         for row in rows:
             scrim = db.get_scrim(row["scrim_id"])
-            participants = db.get_participants(row["scrim_id"])
-            main_count = sum(1 for _, wl in participants if not wl)
-            is_full = scrim is not None and main_count >= scrim["capacity"]
+            is_full = scrim is not None and _count_main(row["scrim_id"]) >= scrim["capacity"]
             self.bot.add_view(
                 ScrimView(row["scrim_id"], is_full=is_full),
                 message_id=row["message_id"],
@@ -303,7 +383,6 @@ class ScrimCog(commands.Cog):
             return
 
         capacity = 정원.value if 정원 is not None else 10
-
         scrim_id = db.create_scrim(
             guild_id=interaction.guild.id,
             channel_id=interaction.channel.id,
@@ -317,6 +396,105 @@ class ScrimCog(commands.Cog):
         await interaction.response.send_message(embed=embed, view=view)
         msg = await interaction.original_response()
         db.set_message_id(scrim_id, msg.id)
+
+    @app_commands.command(name="대신참가", description="다른 사람 대신 참가시키기 (디스코드 없어도 OK)")
+    @app_commands.describe(닉="이름/티어/라인 형식 (예: 홍길동/M350/MID.TOP)")
+    async def proxy_join(self, interaction: discord.Interaction, 닉: str):
+        if interaction.guild is None:
+            await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        parsed = parse_nickname(닉)
+        if not parsed.is_valid:
+            await interaction.response.send_message(NICK_FORMAT_HELP, ephemeral=True)
+            return
+
+        scrim = db.find_latest_open_scrim_in_channel(interaction.channel.id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "이 채널에 모집이 없어요. `/내전모집` 먼저 만들어주세요.",
+                ephemeral=True,
+            )
+            return
+
+        positions_str = ",".join(parsed.positions)
+        main_count_before = _count_main(scrim["scrim_id"])
+        as_waitlist = main_count_before >= scrim["capacity"]
+
+        ok = db.add_proxy_participant(
+            scrim_id=scrim["scrim_id"],
+            name=parsed.name,
+            tier_raw=parsed.tier_raw,
+            positions=positions_str,
+            proxy_by_user_id=interaction.user.id,
+            is_waitlist=as_waitlist,
+        )
+        if not ok:
+            await interaction.response.send_message(
+                f"이미 같은 이름(`{parsed.name}`)이 등록되어 있어요.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"✅ **{parsed.name}** ({parsed.tier_display} / {parsed.positions_display}) "
+            f"{'🕐 대기자로 ' if as_waitlist else ''}등록 완료 (대리: <@{interaction.user.id}>)",
+            ephemeral=False,
+        )
+        # 모집 메시지 갱신
+        scrim = db.get_scrim(scrim["scrim_id"])
+        await _refresh_scrim_message(self.bot, scrim)
+
+    @app_commands.command(name="대신취소", description="대리 등록된 사람 취소 (시전자 또는 서버 관리자만)")
+    @app_commands.describe(닉="취소할 사람의 이름 (대리 등록 시 사용한 이름)")
+    async def proxy_cancel(self, interaction: discord.Interaction, 닉: str):
+        if interaction.guild is None:
+            await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        scrim = db.find_latest_open_scrim_in_channel(interaction.channel.id)
+        if scrim is None:
+            await interaction.response.send_message("이 채널에 모집이 없어요.", ephemeral=True)
+            return
+
+        is_creator = interaction.user.id == scrim["creator_id"]
+        is_admin = (
+            isinstance(interaction.user, discord.Member)
+            and interaction.user.guild_permissions.administrator
+        )
+        if not (is_creator or is_admin):
+            await interaction.response.send_message(
+                "취소는 **모집 시전자** 또는 **서버 관리자**만 가능합니다.",
+                ephemeral=True,
+            )
+            return
+
+        # 대리 등록 여부 확인 (이름으로)
+        target = next(
+            (r for r in db.get_proxy_participants(scrim["scrim_id"]) if r["name"] == 닉),
+            None,
+        )
+        if target is None:
+            await interaction.response.send_message(
+                f"`{닉}` 이름으로 대리 등록된 사람이 없어요.",
+                ephemeral=True,
+            )
+            return
+
+        was_main = (target["is_waitlist"] == 0)
+        db.remove_proxy_participant(scrim["scrim_id"], 닉)
+        promoted = db.promote_oldest_waitlist(scrim["scrim_id"]) if was_main else None
+
+        followup = f"❌ **{닉}** 대리 등록을 취소했어요."
+        if promoted:
+            if promoted["type"] == "own":
+                followup += f"\n→ <@{promoted['user_id']}>님이 대기자에서 자동 승격되었어요! 🎉"
+            else:
+                followup += f"\n→ **{promoted['name']}**님(대리)이 대기자에서 자동 승격되었어요! 🎉"
+
+        await interaction.response.send_message(followup, ephemeral=False)
+        scrim = db.get_scrim(scrim["scrim_id"])
+        await _refresh_scrim_message(self.bot, scrim)
 
 
 async def setup(bot: commands.Bot):
