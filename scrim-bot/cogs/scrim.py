@@ -445,6 +445,29 @@ class ScrimCog(commands.Cog):
         scrim = db.get_scrim(scrim["scrim_id"])
         await _refresh_scrim_message(self.bot, scrim)
 
+    @app_commands.command(name="모집현황", description="현재 모집 명단을 채팅창 아래에 새로 띄우기")
+    async def show_status(self, interaction: discord.Interaction):
+        if interaction.guild is None:
+            await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        scrim = db.find_latest_open_scrim_in_channel(interaction.channel.id)
+        if scrim is None:
+            await interaction.response.send_message(
+                "이 채널에 모집이 없어요. `/내전모집` 먼저 만들어주세요.",
+                ephemeral=True,
+            )
+            return
+
+        embed = await build_embed(self.bot, scrim)
+        is_full = _count_main(scrim["scrim_id"]) >= scrim["capacity"]
+        view = ScrimView(scrim["scrim_id"], is_full=is_full)
+
+        await interaction.response.send_message(embed=embed, view=view)
+        msg = await interaction.original_response()
+        # 이제 새 메시지가 메인 (참가/취소 시 봇이 갱신할 대상)
+        db.set_message_id(scrim["scrim_id"], msg.id)
+
     @app_commands.command(name="대신취소", description="대리 등록된 사람 취소 (시전자 또는 서버 관리자만)")
     @app_commands.describe(닉="취소할 사람의 이름 (대리 등록 시 사용한 이름)")
     async def proxy_cancel(self, interaction: discord.Interaction, 닉: str):
