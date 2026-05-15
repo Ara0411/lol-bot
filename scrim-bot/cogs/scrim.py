@@ -445,7 +445,7 @@ class ScrimCog(commands.Cog):
         scrim = db.get_scrim(scrim["scrim_id"])
         await _refresh_scrim_message(self.bot, scrim)
 
-    @app_commands.command(name="모집현황", description="현재 모집 명단을 채팅창 아래에 새로 띄우기")
+    @app_commands.command(name="내전현황", description="현재 모집 명단을 채팅창 아래에 새로 띄우기")
     async def show_status(self, interaction: discord.Interaction):
         if interaction.guild is None:
             await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
